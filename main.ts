@@ -85,6 +85,32 @@ let cooldownUntil = -1;
 let entryClose = 0;
 let peak = 0;
 
+/** Highest close of the last `n` closes before the bar being decided on; null when fewer than `n` closes exist. */
+function highestCloseBefore(past: number[], n: number): number | null {
+  if (past.length < n) return null;
+  let high = past[past.length - n]!;
+  for (let i = past.length - n + 1; i < past.length; i++) {
+    if (past[i]! > high) high = past[i]!;
+  }
+  return high;
+}
+
+/** Return of `price` against the close `lookback` bars back, in bps; 0 before enough history. */
+function momentumBps(past: number[], price: number, lookback: number): number {
+  if (past.length < lookback) return 0;
+  return (price / past[past.length - lookback]! - 1) * 10000;
+}
+
+/** All entry filters must agree: trend up, a fresh cross (or a retry window), a breakout, momentum, and no cooldown. */
+function entrySignal(gap: number, freshCross: boolean, breakout: boolean, mom: number, seq: number, cooldownUntil: number): boolean {
+  return gap > 0 && freshCross && breakout && mom >= MOM_ENTRY_BPS && seq > cooldownUntil;
+}
+
+/** Exit on whichever comes first: trailing stop, EMA cross down, or momentum collapse. */
+function exitSignal(trailHit: boolean, crossDown: boolean, momDown: boolean): boolean {
+  return trailHit || crossDown || momDown;
+}
+
 await runBars({
   onBatch(state, batch) {
     let bar: Bar | undefined;
@@ -108,30 +134,17 @@ await runBars({
     const gap = fast.value - slow.value;
     const crossUp = prevGap !== null && prevGap <= 0 && gap > 0;
 
-    // Highest close of the last BREAK_BARS bars before this one.
-    let high: number | null = null;
-    if (closes.length >= BREAK_BARS) {
-      high = closes[closes.length - BREAK_BARS];
-      for (let i = closes.length - BREAK_BARS + 1; i < closes.length; i++) {
-        if (closes[i]! > high) high = closes[i]!;
-      }
-    }
-    // 30-bar return in bps, 0 before 30 closes of history.
-    const mom =
-      closes.length >= MOM_BARS ? ((c / closes[closes.length - MOM_BARS]!) - 1) * 10000 : 0;
+    // Highest close of the last BREAK_BARS bars before this one, and the
+    // 30-bar return in bps (0 before 30 closes of history).
+    const high = highestCloseBefore(closes, BREAK_BARS);
+    const mom = momentumBps(closes, c, MOM_BARS);
 
     const held = state.positions.get(SYMBOL);
     let order: BuyInput | SellInput | null = null;
     if (held === undefined) {
       const freshCross = crossUp || state.seq <= retryUntil;
       const breakout = high !== null && c > high;
-      if (
-        gap > 0 &&
-        freshCross &&
-        breakout &&
-        mom >= MOM_ENTRY_BPS &&
-        state.seq > cooldownUntil
-      ) {
+      if (entrySignal(gap, freshCross, breakout, mom, state.seq, cooldownUntil)) {
         const notional = state.cash;
         if (notional >= BigInt(state.hello.fees.min_notional_quote_units)) {
           order = { side: 'buy', symbol: SYMBOL, notional_quote_units: notional, max_slippage_bps: MAX_SLIPPAGE_BPS };
@@ -144,7 +157,7 @@ await runBars({
       const trailHit = ((peak / c) - 1) * 10000 >= TRAIL_BPS;
       const crossDown = prevGap !== null && prevGap >= 0 && gap < 0;
       const momDown = mom <= MOM_EXIT_BPS;
-      if (trailHit || crossDown || momDown) {
+      if (exitSignal(trailHit, crossDown, momDown)) {
         order = { side: 'sell', symbol: SYMBOL, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS };
         if (((c / entryClose) - 1) * 10000 < 0) cooldownUntil = state.seq + COOLDOWN_BARS;
       }
